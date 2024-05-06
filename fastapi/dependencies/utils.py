@@ -22,11 +22,10 @@ import anyio
 from fastapi import params
 from fastapi._compat import (
     PYDANTIC_V2,
-    ErrorWrapper,
     ModelField,
     Required,
     Undefined,
-    _regenerate_error_with_loc,
+    _normalize_errors,
     copy_field_info,
     create_body_model,
     evaluate_forwardref,
@@ -52,6 +51,7 @@ from fastapi.concurrency import (
     contextmanager_in_threadpool,
 )
 from fastapi.dependencies.models import Dependant, SecurityRequirement
+from fastapi.exceptions import ErrorDetails
 from fastapi.logger import logger
 from fastapi.security.base import SecurityBase
 from fastapi.security.oauth2 import OAuth2, SecurityScopes
@@ -553,7 +553,7 @@ async def solve_generator(
 @dataclass
 class SolvedDependency:
     values: Dict[str, Any]
-    errors: List[Any]
+    errors: List[ErrorDetails]
     background_tasks: Optional[StarletteBackgroundTasks]
     response: Response
     dependency_cache: Dict[Tuple[Callable[..., Any], Tuple[str]], Any]
@@ -572,7 +572,7 @@ async def solve_dependencies(
     embed_body_fields: bool,
 ) -> SolvedDependency:
     values: Dict[str, Any] = {}
-    errors: List[Any] = []
+    errors: List[ErrorDetails] = []
     if response is None:
         response = Response()
         del response.headers["content-length"]
@@ -648,7 +648,8 @@ async def solve_dependencies(
     values.update(query_values)
     values.update(header_values)
     values.update(cookie_values)
-    errors += path_errors + query_errors + header_errors + cookie_errors
+    for errors_ in (path_errors, query_errors, header_errors, cookie_errors):
+        errors.extend(errors_)
     if dependant.body_params:
         (
             body_values,
@@ -687,17 +688,15 @@ async def solve_dependencies(
 
 def _validate_value_with_model_field(
     *, field: ModelField, value: Any, values: Dict[str, Any], loc: Tuple[str, ...]
-) -> Tuple[Any, List[Any]]:
+) -> Tuple[Any, List[ErrorDetails]]:
     if value is None:
         if field.required:
             return None, [get_missing_field_error(loc=loc)]
         else:
             return deepcopy(field.default), []
     v_, errors_ = field.validate(value, values, loc=loc)
-    if isinstance(errors_, ErrorWrapper):
-        return None, [errors_]
-    elif isinstance(errors_, list):
-        new_errors = _regenerate_error_with_loc(errors=errors_, loc_prefix=())
+    if errors_ is not None:
+        new_errors = _normalize_errors(errors_)
         return None, new_errors
     else:
         return v_, []
@@ -730,9 +729,9 @@ def _get_multidict_value(
 def request_params_to_args(
     fields: Sequence[ModelField],
     received_params: Union[Mapping[str, Any], QueryParams, Headers],
-) -> Tuple[Dict[str, Any], List[Any]]:
+) -> Tuple[Dict[str, Any], List[ErrorDetails]]:
     values: Dict[str, Any] = {}
-    errors: List[Dict[str, Any]] = []
+    errors: List[ErrorDetails] = []
 
     if not fields:
         return values, errors
@@ -867,9 +866,9 @@ async def request_body_to_args(
     body_fields: List[ModelField],
     received_body: Optional[Union[Dict[str, Any], FormData]],
     embed_body_fields: bool,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+) -> Tuple[Dict[str, Any], List[ErrorDetails]]:
     values: Dict[str, Any] = {}
-    errors: List[Dict[str, Any]] = []
+    errors: List[ErrorDetails] = []
     assert body_fields, "request_body_to_args() should be called with fields"
     single_not_embedded_field = len(body_fields) == 1 and not embed_body_fields
     first_field = body_fields[0]
